@@ -1,0 +1,103 @@
+name: Auto Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: auto-sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream while preserving fork workflows
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          owner="${repo%%/*}"
+          default_branch="${{ github.event.repository.default_branch }}"
+          parent=$(gh api "/repos/$repo" --jq '.parent.full_name // empty')
+          if [ -z "$parent" ]; then
+            echo "No upstream parent configured; nothing to sync."
+            exit 0
+          fi
+          upstream_branch=$(gh api "/repos/$repo" --jq '.parent.default_branch')
+          current_sha=$(git rev-parse HEAD)
+
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          preserve_dir=$(mktemp -d)
+          cp -a .github/workflows "$preserve_dir/workflows"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/$parent.git"
+          git fetch upstream "$upstream_branch" --depth=1
+          upstream_sha=$(git rev-parse "upstream/$upstream_branch")
+
+          compare=$(gh api "/repos/$parent/compare/$upstream_branch...$owner:$default_branch")
+          behind=$(printf '%s' "$compare" | jq -r '.behind_by')
+          ahead=$(printf '%s' "$compare" | jq -r '.ahead_by')
+          status=$(printf '%s' "$compare" | jq -r '.status')
+          echo "Pre-sync compare: status=$status ahead=$ahead behind=$behind"
+
+          git checkout "$default_branch"
+          git reset --hard "upstream/$upstream_branch"
+          mkdir -p .github/workflows
+          rm -rf .github/workflows
+          cp -a "$preserve_dir/workflows" .github/workflows
+
+          if git diff --quiet "$current_sha" --; then
+            echo "No net change after preserving automation files."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: sync upstream while preserving fork workflows"
+          git push --force-with-lease origin HEAD:"$default_branch"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger Cloudflare deployment
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run cloudflare-deploy.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.event.repository.default_branch }}"
+
+      - name: Verify upstream is fully absorbed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          owner="${repo%%/*}"
+          parent=$(gh api "/repos/$repo" --jq '.parent.full_name // empty')
+          [ -n "$parent" ] || exit 0
+          default_branch="${{ github.event.repository.default_branch }}"
+          upstream_branch=$(gh api "/repos/$repo" --jq '.parent.default_branch')
+          compare=$(gh api "/repos/$parent/compare/$upstream_branch...$owner:$default_branch")
+          behind=$(printf '%s' "$compare" | jq -r '.behind_by')
+          ahead=$(printf '%s' "$compare" | jq -r '.ahead_by')
+          status=$(printf '%s' "$compare" | jq -r '.status')
+          echo "Post-sync compare: status=$status ahead=$ahead behind=$behind"
+          if [ "$behind" != "0" ]; then
+            echo "Fork still behind upstream after sync." >&2
+            exit 1
+          fi
