@@ -53,6 +53,10 @@ jobs:
           ahead=$(printf '%s' "$compare" | jq -r '.ahead_by')
           status=$(printf '%s' "$compare" | jq -r '.status')
           echo "Pre-sync compare: status=$status ahead=$ahead behind=$behind"
+          if [ "$behind" = "0" ]; then
+            echo "Fork already contains the latest upstream commit."
+            exit 0
+          fi
 
           git checkout "$default_branch"
           git reset --hard "upstream/$upstream_branch"
